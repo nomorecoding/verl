@@ -1,0 +1,52 @@
+# Standalone Flow-GRPO training configuration
+# For use with train_flow_grpo.py (no Ray/verl infrastructure required)
+#
+# This config is loaded as a reference; actual parameters are passed
+# via command-line arguments.
+
+model:
+  model_path: "/path/to/ming-omni-tts"
+  model_type: moe
+  patch_size: 4
+  history_patch_size: 32
+
+grpo:
+  group_size: 4            # number of generations per prompt
+  norm_adv_by_std: true    # true = GRPO, false = Dr.GRPO
+  ppo_clip: 0.2            # PPO clip ratio epsilon
+
+training:
+  epochs: 10
+  batch_size: 4            # unique prompts per batch
+  mini_batch_size: 2       # micro batch for gradient accumulation
+  lr: 1.0e-6
+  weight_decay: 0.01
+  warmup_steps: 10
+  max_grad_norm: 1.0
+  kl_coef: 0.001           # KL penalty coefficient (0 to disable)
+  entropy_coeff: 0.0
+
+generation:
+  max_decode_steps: 200
+  cfg_scale: 2.0
+  sigma: 0.25
+  temperature: 0
+
+reward:
+  weights:
+    intelligibility: 0.4
+    mos: 0.3
+    duration: 0.1
+    speaker_sim: 0.2
+
+infrastructure:
+  num_gpus: 1
+  gradient_checkpointing: true
+  bf16: true
+  output_dir: ./checkpoints/flow_grpo
+
+logging:
+  log_freq: 1
+  save_freq: 50
+  wandb_project: null        # set to enable wandb
+  experiment_name: ming_moe_flow_grpo
