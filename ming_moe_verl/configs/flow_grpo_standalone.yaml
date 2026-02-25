@@ -1,52 +1,43 @@
-# Standalone Flow-GRPO training configuration
-# For use with train_flow_grpo.py (no Ray/verl infrastructure required)
-#
-# This config is loaded as a reference; actual parameters are passed
-# via command-line arguments.
+# 连续动作空间 Flow-GRPO 训练配置
+# 用于 train_flow_grpo.py
 
 model:
   model_path: "/path/to/ming-omni-tts"
   model_type: moe
-  patch_size: 4
-  history_patch_size: 32
 
 grpo:
-  group_size: 4            # number of generations per prompt
-  norm_adv_by_std: true    # true = GRPO, false = Dr.GRPO
-  ppo_clip: 0.2            # PPO clip ratio epsilon
+  group_size: 4              # N: 每个 prompt 生成数量
+  norm_adv_by_std: true      # true=GRPO, false=Dr.GRPO
+  ppo_clip: 0.2              # PPO clip ratio ε
+  log_prob_method: exact     # exact: ODE 轨迹精确 | surrogate: DDPO 近似
+
+flow_matching:
+  ode_steps: 10              # ODE solver 步数 K
+  cfg_scale: 2.0             # classifier-free guidance
+  sigma: 0.25                # solver stochastic noise scale
+  temperature: 0             # solver temperature
+  max_decode_steps: 200      # 最大自回归步数 T
 
 training:
   epochs: 10
-  batch_size: 4            # unique prompts per batch
-  mini_batch_size: 2       # micro batch for gradient accumulation
+  batch_size: 4              # 每 batch 的唯一 prompt 数
   lr: 1.0e-6
   weight_decay: 0.01
-  warmup_steps: 10
   max_grad_norm: 1.0
-  kl_coef: 0.001           # KL penalty coefficient (0 to disable)
-  entropy_coeff: 0.0
-
-generation:
-  max_decode_steps: 200
-  cfg_scale: 2.0
-  sigma: 0.25
-  temperature: 0
+  kl_coef: 0.001             # KL 正则系数 (0 禁用)
+  gradient_checkpointing: true
+  bf16: true
 
 reward:
   weights:
-    intelligibility: 0.4
-    mos: 0.3
-    duration: 0.1
-    speaker_sim: 0.2
-
-infrastructure:
-  num_gpus: 1
-  gradient_checkpointing: true
-  bf16: true
-  output_dir: ./checkpoints/flow_grpo
+    intelligibility: 0.4     # ASR 可懂度
+    mos: 0.3                 # 音频质量 MOS
+    duration: 0.1            # 时长合理性
+    speaker_sim: 0.2         # 说话人相似度
 
 logging:
+  output_dir: ./checkpoints/flow_grpo
   log_freq: 1
   save_freq: 50
-  wandb_project: null        # set to enable wandb
-  experiment_name: ming_moe_flow_grpo
+  wandb_project: null
+  experiment_name: flow_grpo

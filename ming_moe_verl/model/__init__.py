@@ -1,4 +1,4 @@
-from .policy_forward import BailingMoeTTSForRL
-from .rollout_worker import BailingMoeFlowRollout
+from .policy_forward import FlowGRPOPolicy
+from .rollout_worker import FlowGRPORollout
 
-__all__ = ["BailingMoeTTSForRL", "BailingMoeFlowRollout"]
+__all__ = ["FlowGRPOPolicy", "FlowGRPORollout"]

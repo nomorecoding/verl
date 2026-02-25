@@ -1,268 +1,169 @@
-# Ming-omni-tts MoE 模型 Flow-GRPO 训练方案
+# Ming-omni-tts MoE 模型 Flow-GRPO 训练
 
-基于 [verl](https://github.com/verl-project/verl) 框架，对 [Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts) 的 MoE 模型实现 Flow-GRPO（Group Relative Policy Optimization）强化学习训练。
-
-## 目录
-
-- [架构概览](#架构概览)
-- [两种训练模式](#两种训练模式)
-- [环境安装](#环境安装)
-- [数据准备](#数据准备)
-- [快速开始](#快速开始)
-- [详细步骤](#详细步骤)
-- [代码结构](#代码结构)
-- [关键设计决策](#关键设计决策)
-- [常见问题](#常见问题)
+基于 [verl](https://github.com/verl-project/verl) 的 GRPO 算法思想，对 [Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts) 的 MoE+FlowMatching 模型实现**连续动作空间**的 Flow-GRPO 强化学习训练。
 
 ---
 
-## 架构概览
+## 核心问题：为什么不能直接用标准 GRPO?
 
-Ming-omni-tts 的生成流程不同于标准的 LLM 文本生成，它是 **自回归LLM + Flow Matching** 的混合架构：
+### 标准 GRPO (verl 默认) 的假设
 
 ```
-文本输入 → MoE-LLM 编码 → hidden state → Flow Matching 生成音频 latent → 音频解码
-                ↑                                    │
-                └── latent 投影回 embedding ←─────────┘
+状态: s_t = (prompt, token_{<t})
+动作: a_t ∈ {1, ..., V}                    ← 离散 token
+策略: π(a_t|s_t) = softmax(lm_head(h_t))   ← 过 lm_head → softmax
+log-prob: log_softmax(logits)[token_id]
 ```
 
-每一步生成过程中：
-1. MoE-LLM（BailingMoeForCausalLM，16个专家，top-2路由）处理输入，产生 hidden state
-2. Flow Matching 头（CFM + DiT）以 hidden state 为条件，从噪声采样得到音频 latent
-3. 音频 latent 经 Aggregator 投影回 LLM 的 embedding 空间，作为下一步的输入
-4. 重复直至 stop_head 预测生成结束
+### Ming-omni-tts TTS 模式的实际情况
 
-**GRPO 强化学习目标**：通过 reward（语音质量、可懂度、说话人相似度等）来优化生成策略。
+```
+状态: s_t = (text_prompt, audio_latent_{<t})
+动作: a_t ∈ ℝ^{patch_size × latent_dim}     ← 连续 latent 向量
+策略: MoE-LLM hidden state → flow matching   ← 不走 lm_head
+log-prob: ???  (需要重新定义!)
+```
+
+**关键差异**:
+1. LLM 从头到尾**没有经过 `lm_head → softmax → 离散采样`**
+2. 动作空间是连续的 `ℝ^d`，不是离散的 `{1,...,V}`
+3. 每步生成涉及 K 步 ODE 积分，不是单次 softmax
+
+如果强行用 verl 的 vLLM rollout → 模型走 lm_head 生成文本 token → GRPO 信号和 TTS 品质毫无关系。
 
 ---
 
-## 两种训练模式
+## 解决方案：基于 Stochastic ODE 的连续动作 GRPO
 
-### MODE A: verl 原生 GRPO（推荐）
+### 关键洞察
 
-只训练 MoE-LLM backbone，flow matching 头冻结。
+Ming-omni-tts 的 ODE Solver 在每个积分步加了**高斯随机扰动**:
 
-**优点**：
-- 直接复用 verl 的 FSDP/Megatron 分布式训练 + vLLM 推理引擎
-- 基础设施成熟，分布式扩展性好
-- MoE-LLM 的条件表示更好 → 音频质量自然提升
+```python
+# Ming-omni-tts/fm/CFM.py, Solver.integrate()
+y1 = y0 + dt * f0                                          # 确定性步
+noise = torch.randn_like(y0)
+shift = self.sigma * (self.temperature ** 0.5) * (abs(dt) ** 0.5) * noise  # 随机扰动
+y0 = y1 + shift
+```
 
-**适用场景**：
-- 大规模多机多卡训练
-- 需要 verl 的完整功能（rollout correction、checkpointing、wandb 集成等）
+这意味着每步的转移概率是一个**显式的高斯分布**:
 
-### MODE B: 完整管线 Flow-GRPO
+```
+p(y_{k+1} | y_k, c; θ) = N(y_{k+1} | μ_k, σ_k² · I)
 
-同时训练 MoE-LLM 和 flow matching 头。
+其中:
+  μ_k = y_k + dt_k · v_θ(y_k, t_k, c)     ← 确定性预测（依赖模型参数 θ）
+  σ_k = σ · √(T · |dt_k|)                  ← 固定方差（只依赖 solver 配置）
+```
 
-**优点**：
-- 端到端优化，flow matching 也能适应 reward 信号
-- 使用自定义的 surrogate log-prob（基于 CFM loss）进行策略更新
+### 完整的 Flow-GRPO 公式
 
-**适用场景**：
-- 单机少卡实验
-- 需要优化 flow matching 头本身
-- 研究/探索目的
+**Per-ODE-step log-prob:**
+$$\log p(y_{k+1} | y_k, c; \theta) = -\frac{1}{2\sigma_k^2} \|y_{k+1} - \mu_k\|^2 - \frac{d}{2}\log(2\pi\sigma_k^2)$$
+
+**Per-autoregressive-step log-prob** (K 个 ODE 步求和):
+$$\log \pi(a_t | s_t; \theta) = \sum_{k=0}^{K-1} \log p(y_{k+1} | y_k, c_t; \theta)$$
+
+**Importance ratio:**
+$$r_t = \exp\left(\log \pi_{\theta_{new}}(a_t | s_t) - \log \pi_{\theta_{old}}(a_t | s_t)\right)$$
+
+**为什么 ratio 不是 1?** 当 θ 变了:
+- `v_θ` (DiT 的 velocity field) 变了 → `μ_k` 变了
+- `c_t` (LLM conditioning) 也变了（因为 MoE 参数变了）
+- 但 `y_{k+1}` 是旧轨迹的点，固定不变
+- 所以高斯 log-prob 变了 → ratio ≠ 1
+
+**GRPO + PPO-clip loss:**
+$$\mathcal{L} = -\mathbb{E}\left[\min\left(r_t \cdot A, \text{clip}(r_t, 1\pm\epsilon) \cdot A\right)\right]$$
+
+其中 A 是 GRPO 组内归一化的 advantage。
+
+### 梯度回传路径
+
+```
+∂L/∂θ_DiT       ← 通过 v_θ 的预测影响 μ_k
+∂L/∂θ_MoE_LLM   ← 通过 conditioning c_t 影响 μ_k
+∂L/∂θ_Aggregator ← 通过 latent→embedding 投影影响 c_{t+1}
+```
+
+所有组件都参与梯度更新。
+
+---
+
+## 两种 log-prob 计算方法
+
+### 1. 精确方法 (`--log_prob_method exact`)
+
+保存完整 ODE 轨迹 `{y_0, y_1, ..., y_K}`，训练时用新参数重新计算 `v_{θ_new}` 在旧轨迹点上的值。
+
+- **精确**: 无近似误差
+- **存储**: T × K × patch_size × latent_dim floats/sample
+
+### 2. DDPO 代理方法 (`--log_prob_method surrogate`)
+
+只保存初始噪声 `y_0` 和最终 latent `a_t`，用随机时间步近似:
+
+$$\log \pi_\theta(a_t | s_t) \approx -\mathbb{E}_{\tau}\left[\|v_\theta(x_\tau, \tau, c) - (a_t - y_0)\|^2\right]$$
+
+- **高效**: 存储量最小
+- **近似**: 有偏但在扩散 RL (DDPO) 中被广泛验证
 
 ---
 
 ## 环境安装
 
-### 1. 基础依赖
-
 ```bash
 pip install torch>=2.1 transformers>=4.40 accelerate
 pip install pandas pyarrow
-pip install x-transformers   # Ming-omni-tts DiT 模块需要
-```
+pip install x-transformers   # Ming-omni-tts DiT 依赖
 
-### 2. 安装 verl（MODE A 需要）
+# 可选: verl 组件（用于分布式训练辅助）
+pip install verl
 
-```bash
-# 推荐从源码安装
-git clone https://github.com/verl-project/verl.git
-cd verl
-pip install -e ".[all]"
-
-# 安装 vLLM（用于高效 rollout）
-pip install vllm>=0.6
-```
-
-### 3. 克隆 Ming-omni-tts 模型代码
-
-```bash
+# 克隆模型代码
 git clone https://github.com/inclusionAI/Ming-omni-tts.git
-export MING_MODEL_DIR=$(pwd)/Ming-omni-tts
-export PYTHONPATH="${MING_MODEL_DIR}:${PYTHONPATH}"
+export PYTHONPATH="$(pwd)/Ming-omni-tts:$PYTHONPATH"
 ```
-
-### 4. 下载模型权重
-
-根据 Ming-omni-tts 仓库的说明下载预训练权重。
 
 ---
 
 ## 数据准备
 
-### verl 数据格式
-
-verl 期望 Parquet 格式的训练数据，包含以下列：
-
-| 列名 | 类型 | 说明 |
-|------|------|------|
-| `prompt` | list[dict] | 对话格式 `[{"role": "user", "content": "..."}]` |
-| `data_source` | str | 数据来源标识 |
-| `reward_model` | dict | 奖励计算所需信息 |
-| `extra_info` | dict | 辅助元数据 |
-
-### 从 TTS 语料制作训练数据
-
 ```bash
-# 方式1: 从 JSONL manifest 转换
+# 从 TTS manifest 转换
 python -m ming_moe_verl.data.preprocess \
     --manifest /path/to/tts_manifest.jsonl \
-    --output_dir ./data/tts_grpo \
-    --split train
+    --output_dir ./data/tts_grpo
 
-# 方式2: 创建示例数据（测试用）
+# 或创建示例数据
 python -m ming_moe_verl.data.preprocess --create_demo --output_dir ./data/tts_grpo
-```
-
-JSONL manifest 格式：
-```json
-{"text": "你好世界", "audio_path": "/data/audio/001.wav", "speaker_id": "spk01", "emotion": "neutral", "duration": 3.2}
 ```
 
 ---
 
 ## 快速开始
 
-### MODE A: verl 原生 GRPO
-
 ```bash
-# 1. 准备数据
-python -m ming_moe_verl.data.preprocess --create_demo --output_dir ./data/tts_grpo
-
-# 2. 注册模型并启动训练
-export MING_MODEL_DIR=/path/to/Ming-omni-tts
-export MODEL_PATH=/path/to/bailing-moe-weights
-
-bash ming_moe_verl/scripts/run_flow_grpo_verl.sh
-```
-
-### MODE B: 完整管线 Flow-GRPO
-
-```bash
-# 1. 准备数据
-python -m ming_moe_verl.data.preprocess --create_demo --output_dir ./data/tts_grpo
-
-# 2. 启动训练
 export MODEL_PATH=/path/to/ming-omni-tts-weights
 export TRAIN_DATA=./data/tts_grpo/train.parquet
-export VAL_DATA=./data/tts_grpo/test.parquet
 
-bash ming_moe_verl/scripts/run_flow_grpo_standalone.sh
-```
+# 精确 log-prob 方法
+python -m ming_moe_verl.train_flow_grpo \
+    --model_path $MODEL_PATH \
+    --train_data $TRAIN_DATA \
+    --grpo_group_size 4 \
+    --log_prob_method exact \
+    --ode_steps 10 \
+    --lr 1e-6 \
+    --ppo_clip 0.2 \
+    --kl_coef 0.001
 
----
-
-## 详细步骤
-
-### 步骤 1: 理解 MoE 模型结构
-
-BailingMoeForCausalLM 是一个 MoE Transformer：
-- **专家数量**: 16（可配置）
-- **Top-K 路由**: top-2
-- **路由门控**: 线性层 + softmax + top-k 选择
-- **共享专家**: 可选（`num_shared_experts`）
-- **前 K 层稠密**: `first_k_dense_replace` 控制
-
-关键配置参数：
-```python
-BailingMoeConfig(
-    num_experts=16,
-    num_experts_per_tok=2,
-    num_shared_experts=0,
-    norm_topk_prob=True,
-    first_k_dense_replace=0,
-    hidden_size=1024,
-    num_hidden_layers=24,
-    num_attention_heads=16,
-)
-```
-
-### 步骤 2: 理解 verl GRPO 算法
-
-GRPO 的核心思想：
-1. 对每个 prompt，生成 N 个响应（group）
-2. 计算每个响应的 reward
-3. 在 group 内做优势归一化：`advantage = (reward - mean) / std`
-4. 用 PPO-clip loss 更新策略
-
-```
-对每个 prompt p:
-  生成 N 个响应: y₁, y₂, ..., yₙ ~ π_θ(·|p)
-  计算 reward:   r₁, r₂, ..., rₙ
-  组内归一化:    aᵢ = (rᵢ - μ) / σ
-  更新策略:      L = -min(ratio·a, clip(ratio)·a)
-```
-
-### 步骤 3: 将 MoE 模型注册到 HuggingFace AutoModel
-
-```python
-from transformers import AutoConfig, AutoModelForCausalLM
-
-# 导入 Ming-omni-tts 的模型类
-from configuration_bailing_moe import BailingMoeConfig
-from modeling_bailing_moe import BailingMoeForCausalLM
-
-# 注册
-AutoConfig.register("bailing_moe", BailingMoeConfig)
-AutoModelForCausalLM.register(BailingMoeConfig, BailingMoeForCausalLM)
-```
-
-### 步骤 4: 配置 GRPO 训练参数
-
-关键参数说明：
-
-| 参数 | 说明 | 推荐值 |
-|------|------|--------|
-| `algorithm.adv_estimator` | 设为 `grpo` | `grpo` |
-| `actor_rollout_ref.rollout.n` | 每个 prompt 生成数量 | 4-8 |
-| `actor_rollout_ref.actor.use_kl_loss` | KL 散度正则 | `True` |
-| `actor_rollout_ref.actor.kl_loss_coef` | KL 系数 | 0.001 |
-| `actor_rollout_ref.actor.ppo_mini_batch_size` | PPO mini batch | batch_size/4 |
-| `actor_rollout_ref.actor.optim.lr` | 学习率 | 1e-6 |
-
-### 步骤 5: 设计 TTS Reward
-
-我们定义了多维度的 TTS reward：
-
-```python
-reward = w₁ × intelligibility   # ASR 可懂度 (WER/CER)
-       + w₂ × mos               # 音频质量 (MOS 预测)
-       + w₃ × duration          # 时长合理性
-       + w₄ × speaker_sim       # 说话人相似度
-```
-
-在 `ming_moe_verl/reward/tts_reward.py` 中实现，可以插入外部 ASR / MOS / 说话人模型。
-
-### 步骤 6: 启动训练
-
-参见 [快速开始](#快速开始) 章节。
-
-### 步骤 7: 监控与评估
-
-```bash
-# 使用 wandb 监控
-trainer.logger='["console","wandb"]'
-trainer.project_name=ming_moe_flow_grpo
-
-# 关键指标
-# - avg_reward: 平均 reward（应持续上升）
-# - policy_loss: PPO 策略损失
-# - approx_kl: 近似 KL 散度（不应过大）
-# - clip_fraction: PPO 裁剪比例（0.1-0.3 正常）
+# 或用 DDPO 代理方法（更省存储）
+python -m ming_moe_verl.train_flow_grpo \
+    --model_path $MODEL_PATH \
+    --train_data $TRAIN_DATA \
+    --log_prob_method surrogate
 ```
 
 ---
@@ -271,126 +172,42 @@ trainer.project_name=ming_moe_flow_grpo
 
 ```
 ming_moe_verl/
-├── __init__.py
 ├── model/
-│   ├── __init__.py
-│   ├── policy_forward.py      # BailingMoeTTSForRL - 策略模型封装
-│   │                          #   - compute_log_prob_for_step(): CFM surrogate log-prob
-│   │                          #   - compute_sequence_log_probs(): 序列级 log-prob
-│   │                          #   - generate_audio_latents(): 音频 latent 生成
-│   └── rollout_worker.py      # BailingMoeFlowRollout - 自定义 rollout 引擎
-│                              #   - prepare_prompt_tokens(): 文本 → token
-│                              #   - generate_batch(): 批量 rollout 生成
+│   ├── policy_forward.py     # FlowGRPOPolicy
+│   │   ├── _compute_ode_log_prob_exact()    # 精确 ODE 轨迹 log-prob
+│   │   ├── _compute_ode_log_prob_surrogate() # DDPO 代理 log-prob
+│   │   ├── rollout_step()                    # 单步 rollout + 保存轨迹
+│   │   └── compute_sequence_log_probs()      # teacher-forced 序列 log-prob
+│   └── rollout_worker.py     # FlowGRPORollout
+│       ├── rollout_single()   # 完整自回归 flow matching 生成
+│       └── generate_batch()   # 批量生成 N 个 rollout
 ├── reward/
-│   ├── __init__.py
-│   └── tts_reward.py          # TTSRewardManager - TTS reward 管理器
-│                              #   - compute_tts_reward(): 多维度 reward 计算
-│                              #   - TTSRewardManager: verl 兼容的 reward 接口
+│   └── tts_reward.py         # TTS 多维度 reward
 ├── data/
-│   ├── __init__.py
-│   └── preprocess.py          # 数据预处理
-│                              #   - create_tts_parquet(): manifest → parquet
-│                              #   - create_demo_data(): 创建示例数据
-├── configs/
-│   ├── flow_grpo_fsdp.yaml    # verl FSDP 模式配置
-│   └── flow_grpo_standalone.yaml  # 独立训练配置
-├── scripts/
-│   ├── run_flow_grpo_verl.sh      # MODE A 启动脚本
-│   └── run_flow_grpo_standalone.sh # MODE B 启动脚本
-├── train_flow_grpo.py         # MODE B: 完整管线 Flow-GRPO 训练
-└── train_flow_grpo_verl_native.py  # MODE A: verl 原生 GRPO 训练
+│   └── preprocess.py         # TTS 数据 → parquet
+├── configs/                  # 配置文件
+├── scripts/                  # 启动脚本
+├── train_flow_grpo.py        # 主训练入口
+└── train_flow_grpo_verl_native.py  # 说明为何不能直接用 verl 原生
 ```
 
 ---
 
-## 关键设计决策
+## 与相关工作的对比
 
-### 1. Surrogate Log-Prob（代理对数概率）
-
-标准 GRPO 需要 `log π(a|s)` 来计算重要性比率。但 flow matching 生成的是连续 latent 而非离散 token。
-
-我们使用 **CFM loss 作为 surrogate log-prob**：
-
-```
-log π(aₜ | sₜ) ≈ -½ ‖v_θ(xₜ, t, c) - (x₁ - x₀)‖²
-```
-
-这在连续动作空间的 RL（如 Diffusion Policy、DDPO）中是常见做法。
-
-### 2. MoE 专家路由在 RL 中的处理
-
-BailingMoe 使用 top-2 路由，路由决策在前向传播中隐式确定。verl 支持 MoE 模型的 **router replay**（在训练时复用 rollout 阶段的路由决策），可以减少 off-policy 偏差。
-
-在 Megatron backend 下可以启用：
-```yaml
-actor_rollout_ref.actor.router_replay.enable: True
-actor_rollout_ref.actor.router_replay.mode: "R3"
-```
-
-### 3. 奖励设计
-
-TTS 的奖励需要平衡多个维度：
-- **可懂度**权重最高（0.4），因为说清楚是基本要求
-- **音质**次之（0.3），MOS 预测反映主观感受
-- **说话人相似度**（0.2）保证音色一致性
-- **时长**（0.1）防止生成过长/过短
-
-### 4. 分布式策略
-
-- **FSDP**：适合单节点多卡（8x H100/A100），MoE 参数量大需要分片
-- **Megatron**：适合多节点，支持 Expert Parallel + Tensor Parallel
-- **vLLM rollout**：高效推理，支持 MoE 模型的 tensor parallelism
-
----
-
-## 常见问题
-
-### Q: 模型注册失败 `BailingMoe not found`
-
-确保设置了环境变量：
-```bash
-export MING_MODEL_DIR=/path/to/Ming-omni-tts
-export PYTHONPATH="${MING_MODEL_DIR}:${PYTHONPATH}"
-```
-
-### Q: vLLM 不支持 BailingMoe
-
-BailingMoe 的架构与 DeepSeek-MoE 类似。可能需要在 vLLM 中添加对应的 weight loader。
-verl 已有相关 patch：参见 `verl/utils/vllm/patch.py`。
-
-作为替代，可以使用 `naive` rollout（纯 HuggingFace generate）：
-```yaml
-actor_rollout_ref.rollout.name: naive
-```
-
-### Q: 显存不足
-
-- 启用 gradient checkpointing: `enable_gradient_checkpointing=True`
-- 减小 micro batch size: `ppo_micro_batch_size_per_gpu=1`
-- 启用参数卸载: `fsdp_config.param_offload=True`
-- 减少 group size: `rollout.n=2`
-
-### Q: 如何接入真实的 ASR/MOS 模型
-
-在 `TTSRewardManager` 中传入外部模型：
-```python
-import whisper
-asr_model = whisper.load_model("base")
-
-reward_manager = TTSRewardManager(
-    tokenizer=tokenizer,
-    audio_decoder=model.audio,
-    asr_model=asr_model,  # Whisper for ASR
-    mos_model=utmos_model,  # UTMOS for MOS prediction
-)
-```
+| 方法 | 动作空间 | log-prob 来源 | 适用模型 |
+|------|---------|--------------|---------|
+| verl GRPO | 离散 token | `log_softmax(logits)[token]` | 标准 LLM |
+| DDPO | 连续 (扩散) | denoising loss surrogate | Diffusion model |
+| **Flow-GRPO (本方案)** | **连续 (flow matching)** | **stochastic ODE 高斯转移** | **MoE-LLM + FM** |
+| RLHF-Flow | 连续 | CNF exact likelihood | Flow model |
 
 ---
 
 ## 参考
 
-- [verl: Volcano Engine Reinforcement Learning for LLMs](https://github.com/verl-project/verl)
+- [GRPO](https://arxiv.org/abs/2402.03300) - Group Relative Policy Optimization
+- [DDPO](https://arxiv.org/abs/2305.13301) - Training Diffusion Models with RL
+- [Flow Matching](https://arxiv.org/abs/2210.02747) - Conditional Flow Matching
+- [verl](https://github.com/verl-project/verl) - RL framework for LLMs
 - [Ming-omni-tts](https://github.com/inclusionAI/Ming-omni-tts)
-- [GRPO: Group Relative Policy Optimization](https://arxiv.org/abs/2402.03300)
-- [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747)
-- [DDPO: Training Diffusion Models with Reinforcement Learning](https://arxiv.org/abs/2305.13301)
