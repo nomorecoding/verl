@@ -35,6 +35,7 @@ def compute_tts_reward(
     spk_model=None,
     weights: Optional[Dict[str, float]] = None,
     max_expected_steps: int = 200,
+    chars_per_step: float = 2.5,
 ) -> Dict[str, float]:
     """
     Compute a composite reward for a single TTS generation.
@@ -78,7 +79,9 @@ def compute_tts_reward(
 
     # ---- Duration reward (always available) ----
     # Mild Gaussian-shaped reward centred at a "reasonable" length
-    expected = max(5, min(T, max_expected_steps))
+    # Estimate expected duration from text length (chars_per_step heuristic)
+    text_len = len(prompt_text) if prompt_text else 1
+    expected = max(5, min(text_len / chars_per_step, max_expected_steps))
     duration_ratio = T / max(expected, 1)
     scores["duration"] = math.exp(-0.5 * ((duration_ratio - 1.0) / 0.3) ** 2)
 

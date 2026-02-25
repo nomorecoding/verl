@@ -246,7 +246,8 @@ class BailingMoeTTSForRL(nn.Module):
             step_lp = self.compute_log_prob_for_step(z, sampled, latent_history)
             all_log_probs.append(step_lp)
 
-            if self.model.stop_head(z)[0, 0].softmax(dim=-1)[1] > 0.5 and step > 3:
+            stop_probs = self.model.stop_head(z)[:, 0].softmax(dim=-1)[:, 1]
+            if (stop_probs > 0.5).all() and step > 3:
                 break
 
             inputs_embeds = self.model.linear_proj_audio(sampled)

@@ -72,7 +72,7 @@ def parse_args():
 
     # GRPO parameters
     parser.add_argument("--grpo_group_size", type=int, default=4, help="Number of generations per prompt (n)")
-    parser.add_argument("--norm_adv_by_std", action="store_true", default=True,
+    parser.add_argument("--norm_adv_by_std", type=lambda x: x.lower() in ('true', '1', 'yes'), default=True,
                         help="Normalise GRPO advantage by std (True=GRPO, False=Dr.GRPO)")
 
     # Training
@@ -370,13 +370,13 @@ def main():
             model.train()
 
             input_ids = rollout_data["input_ids"]
-            attn_mask = rollout_data["attention_mask_prompt"]
+            attn_mask = rollout_data["attention_mask"]
             audio_latents = rollout_data["audio_latents"]
             old_log_probs = rollout_data["old_log_probs"]
             response_mask = rollout_data["response_mask"]
 
             total_policy_loss = 0.0
-            num_mini_batches = max(1, B_total // args.mini_batch_size)
+            num_mini_batches = max(1, (B_total + args.mini_batch_size - 1) // args.mini_batch_size)
 
             for mb_idx in range(num_mini_batches):
                 mb_start = mb_idx * args.mini_batch_size
@@ -428,10 +428,10 @@ def main():
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
-                scheduler.step()
 
                 total_policy_loss += loss.item()
 
+            scheduler.step()
             update_time = time.time() - t2
             global_step += 1
 
