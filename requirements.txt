@@ -1,0 +1,29 @@
+# Core dependencies
+torch>=2.1
+transformers>=4.40
+accelerate>=0.33
+
+# Data processing
+pandas>=2.0
+pyarrow>=14.0
+
+# Ming-omni-tts model dependency
+x-transformers>=1.30
+
+# verl framework (install from source recommended)
+# pip install -e ".[all]" from https://github.com/verl-project/verl
+# verl
+
+# vLLM for rollout (MODE A)
+# vllm>=0.6
+
+# Optional: Reward computation models
+# openai-whisper       # ASR for intelligibility
+# resemblyzer          # Speaker similarity
+# speechmos            # MOS prediction
+
+# Optional: Experiment tracking
+# wandb
+
+# Optional: Ray (installed by verl)
+# ray[default]>=2.10
