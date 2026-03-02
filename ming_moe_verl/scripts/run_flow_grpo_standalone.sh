@@ -11,6 +11,7 @@ TRAIN_DATA=${TRAIN_DATA:-"./data/tts_grpo/train.parquet"}
 VAL_DATA=${VAL_DATA:-"./data/tts_grpo/test.parquet"}
 OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/flow_grpo"}
 
+TRAIN_MODE=${TRAIN_MODE:-"llm_only"}  # llm_only or full
 GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-4}
 LOG_PROB_METHOD=${LOG_PROB_METHOD:-"exact"}  # exact or surrogate
 ODE_STEPS=${ODE_STEPS:-10}
@@ -36,6 +37,7 @@ python -m ming_moe_verl.train_flow_grpo \
     --model_path "${MODEL_PATH}" \
     --model_type moe \
     --train_data "${TRAIN_DATA}" \
+    --train_mode ${TRAIN_MODE} \
     --grpo_group_size ${GRPO_GROUP_SIZE} \
     --log_prob_method ${LOG_PROB_METHOD} \
     --ode_steps ${ODE_STEPS} \

@@ -82,6 +82,12 @@ def parse_args():
                         choices=["exact", "surrogate"],
                         help="exact: 保存 ODE 轨迹精确计算; surrogate: DDPO 风格近似")
 
+    # Training scope
+    parser.add_argument("--train_mode", type=str, default="llm_only",
+                        choices=["llm_only", "full"],
+                        help="llm_only: 只训练 MoE-LLM backbone (冻结 DiT/CFM/Aggregator/stop_head); "
+                             "full: 训练全部参数")
+
     # Training
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -210,6 +216,45 @@ def main():
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
+    # ---- 根据 train_mode 冻结参数 ----
+    if args.train_mode == "llm_only":
+        frozen_modules = []
+        # 冻结 flow matching head (DiT + CFM)
+        for p in model.flowloss.parameters():
+            p.requires_grad = False
+        frozen_modules.append(f"flowloss ({sum(1 for _ in model.flowloss.parameters())} params)")
+
+        # 冻结 audio Aggregator (latent → LLM embedding 投影)
+        for p in model.linear_proj_audio.parameters():
+            p.requires_grad = False
+        frozen_modules.append(f"linear_proj_audio ({sum(1 for _ in model.linear_proj_audio.parameters())} params)")
+
+        # 冻结 stop head
+        for p in model.stop_head.parameters():
+            p.requires_grad = False
+        frozen_modules.append(f"stop_head ({sum(1 for _ in model.stop_head.parameters())} params)")
+
+        # 冻结 speaker head
+        if hasattr(model, "spk_head"):
+            for p in model.spk_head.parameters():
+                p.requires_grad = False
+            frozen_modules.append(f"spk_head ({sum(1 for _ in model.spk_head.parameters())} params)")
+
+        # 冻结 audio tokenizer (VAE)
+        if hasattr(model, "audio"):
+            for p in model.audio.parameters():
+                p.requires_grad = False
+            frozen_modules.append(f"audio VAE ({sum(1 for _ in model.audio.parameters())} params)")
+
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[train_mode=llm_only] 冻结模块: {frozen_modules}")
+        print(f"  总参数: {total:,}  可训练: {trainable:,} ({trainable/total*100:.1f}%)")
+        print(f"  只训练 MoE-LLM backbone (model.model = BailingMoeForCausalLM)")
+    else:
+        total = sum(p.numel() for p in model.parameters())
+        print(f"[train_mode=full] 训练全部参数: {total:,}")
+
     # 策略封装
     from ming_moe_verl.model.policy_forward import FlowGRPOPolicy
     policy = FlowGRPOPolicy(
@@ -266,11 +311,15 @@ def main():
 
     print("=" * 70)
     print("Continuous-action Flow-GRPO Training")
+    print(f"  train mode: {args.train_mode}")
     print(f"  log-prob method: {args.log_prob_method}")
     print(f"  ODE steps: {args.ode_steps}")
     print(f"  GRPO group size: {args.grpo_group_size}")
     print(f"  PPO clip: {args.ppo_clip}")
     print(f"  KL coef: {args.kl_coef}")
+    if args.train_mode == "llm_only":
+        print("  注意: 只训练 MoE-LLM, DiT/CFM/Aggregator 冻结")
+        print("  梯度回传路径: L → log_π → μ_k → v_DiT(frozen) → c_t → θ_LLM")
     print("=" * 70)
 
     global_step = 0
