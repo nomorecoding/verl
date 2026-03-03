@@ -16,11 +16,13 @@ API 端点:
 import argparse
 import asyncio
 import json
+import math
 import os
 import sys
 import tempfile
 import time
 import traceback
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +43,32 @@ app = FastAPI(
     description="使用 acestep-5Hz-lm 模型对音频进行自动化 caption 标注",
     version="1.0.0",
 )
+
+
+def patch_no_meta_tensor_loading():
+    """
+    Disable transformers meta-tensor model loading to fix FSQ compatibility.
+
+    transformers >= 4.x defaults to low_cpu_mem_usage=True, which initializes
+    models on the 'meta' device. This breaks vector_quantize_pytorch.FSQ which
+    calls .item() on buffers during __init__. Disabling meta-tensor loading
+    uses slightly more RAM during init but avoids the issue entirely.
+    """
+    try:
+        import transformers.modeling_utils as mu
+
+        _orig_from_pretrained = mu.PreTrainedModel.from_pretrained
+
+        @classmethod
+        @wraps(_orig_from_pretrained.__func__)
+        def _patched_from_pretrained(cls, *args, **kwargs):
+            kwargs.setdefault("low_cpu_mem_usage", False)
+            return _orig_from_pretrained.__func__(cls, *args, **kwargs)
+
+        mu.PreTrainedModel.from_pretrained = _patched_from_pretrained
+        print("[PATCH] Disabled meta-tensor model loading for FSQ compatibility")
+    except Exception as e:
+        print(f"[WARN] Failed to apply meta-tensor patch: {e}")
 
 
 def ensure_acestep_installed():
@@ -224,6 +252,7 @@ def main():
     args = parser.parse_args()
 
     ensure_acestep_installed()
+    patch_no_meta_tensor_loading()
     init_models(
         lm_model=args.lm_model,
         lm_backend=args.lm_backend,

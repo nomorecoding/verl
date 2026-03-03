@@ -29,10 +29,12 @@ ACE-Step 1.5 自动化 Music Caption 脚本
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
 import traceback
+from functools import wraps
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -40,6 +42,32 @@ SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".opus"}
 
 ACEST_REPO_URL = "https://github.com/ace-step/ACE-Step-1.5.git"
 ACEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ACE-Step-1.5")
+
+
+def patch_no_meta_tensor_loading():
+    """
+    Disable transformers meta-tensor model loading to fix FSQ compatibility.
+
+    transformers >= 4.x defaults to low_cpu_mem_usage=True, which initializes
+    models on the 'meta' device. This breaks vector_quantize_pytorch.FSQ which
+    calls .item() on buffers during __init__. Disabling meta-tensor loading
+    uses slightly more RAM during init but avoids the issue entirely.
+    """
+    try:
+        import transformers.modeling_utils as mu
+
+        _orig_from_pretrained = mu.PreTrainedModel.from_pretrained
+
+        @classmethod
+        @wraps(_orig_from_pretrained.__func__)
+        def _patched_from_pretrained(cls, *args, **kwargs):
+            kwargs.setdefault("low_cpu_mem_usage", False)
+            return _orig_from_pretrained.__func__(cls, *args, **kwargs)
+
+        mu.PreTrainedModel.from_pretrained = _patched_from_pretrained
+        print("[PATCH] Disabled meta-tensor model loading for FSQ compatibility")
+    except Exception as e:
+        print(f"[WARN] Failed to apply meta-tensor patch: {e}")
 
 
 def ensure_acestep_installed():
@@ -313,6 +341,7 @@ def main():
     args = parser.parse_args()
 
     ensure_acestep_installed()
+    patch_no_meta_tensor_loading()
 
     audio_path = args.audio or args.audio_dir
     audio_files = scan_audio_files(audio_path)
