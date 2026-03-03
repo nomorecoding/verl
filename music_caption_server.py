@@ -16,13 +16,11 @@ API 端点:
 import argparse
 import asyncio
 import json
-import math
 import os
 import sys
 import tempfile
 import time
 import traceback
-from functools import wraps
 from pathlib import Path
 from typing import Optional
 
@@ -47,28 +45,48 @@ app = FastAPI(
 
 def patch_no_meta_tensor_loading():
     """
-    Disable transformers meta-tensor model loading to fix FSQ compatibility.
+    Replace accelerate's init_empty_weights with a no-op in transformers.
 
-    transformers >= 4.x defaults to low_cpu_mem_usage=True, which initializes
-    models on the 'meta' device. This breaks vector_quantize_pytorch.FSQ which
-    calls .item() on buffers during __init__. Disabling meta-tensor loading
-    uses slightly more RAM during init but avoids the issue entirely.
+    For sharded models, transformers ALWAYS uses init_empty_weights() (meta device)
+    regardless of low_cpu_mem_usage. This breaks vector_quantize_pytorch.FSQ which
+    calls .item() on buffers during __init__. Disabling init_empty_weights makes the
+    model instantiate with real (random) tensors on CPU, then weights are loaded
+    normally. Uses more RAM during init but avoids meta tensor issues entirely.
     """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _noop_init_empty_weights(*args, **kwargs):
+        yield
+
+    patched = []
+
     try:
         import transformers.modeling_utils as mu
+        if hasattr(mu, "init_empty_weights"):
+            mu.init_empty_weights = _noop_init_empty_weights
+            patched.append("transformers.modeling_utils")
+    except (ImportError, AttributeError):
+        pass
 
-        _orig_from_pretrained = mu.PreTrainedModel.from_pretrained
+    try:
+        import accelerate
+        accelerate.init_empty_weights = _noop_init_empty_weights
+        patched.append("accelerate")
+    except (ImportError, AttributeError):
+        pass
 
-        @classmethod
-        @wraps(_orig_from_pretrained.__func__)
-        def _patched_from_pretrained(cls, *args, **kwargs):
-            kwargs.setdefault("low_cpu_mem_usage", False)
-            return _orig_from_pretrained.__func__(cls, *args, **kwargs)
+    try:
+        import accelerate.big_modeling
+        accelerate.big_modeling.init_empty_weights = _noop_init_empty_weights
+        patched.append("accelerate.big_modeling")
+    except (ImportError, AttributeError):
+        pass
 
-        mu.PreTrainedModel.from_pretrained = _patched_from_pretrained
-        print("[PATCH] Disabled meta-tensor model loading for FSQ compatibility")
-    except Exception as e:
-        print(f"[WARN] Failed to apply meta-tensor patch: {e}")
+    if patched:
+        print(f"[PATCH] Disabled init_empty_weights in: {', '.join(patched)}")
+    else:
+        print("[WARN] Could not patch init_empty_weights - meta tensor issues may occur")
 
 
 def ensure_acestep_installed():
