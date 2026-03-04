@@ -141,13 +141,63 @@ python acestep/acestep_v15_pipeline.py
 | `--quantization` | None | DiT 量化（int8_weight_only / fp8_weight_only） |
 | `--temperature` | 0.7 | LLM 生成温度 |
 
+## Music Generation（音乐生成）
+
+### CLI 命令行
+
+```bash
+# LM+DiT 模式（最佳质量，LM 规划 + DiT 合成）
+python music_generate.py \
+    --caption "A dreamy synthwave track with lush pads" \
+    --lyrics "[Verse 1]\nWalking down the street" \
+    --duration 60
+
+# 纯 DiT 模式（不加载 LM，节省显存）
+python music_generate.py --mode dit \
+    --caption "Calm piano jazz" --duration 30
+
+# 批量生成多个变体
+python music_generate.py --caption "Epic orchestral" --batch_size 4
+
+# 从 JSON 文件批量生成
+python music_generate.py --from_json tasks.json
+```
+
+**tasks.json 格式：**
+
+```json
+[
+  {"caption": "A pop song with catchy hooks", "lyrics": "[Chorus]\nLa la la", "duration": 60},
+  {"caption": "Ambient piano", "duration": 30, "bpm": 80, "tag": "ambient"}
+]
+```
+
+### HTTP API 服务
+
+```bash
+# 启动服务
+python music_generate_server.py --port 8080
+
+# 生成音乐（返回 WAV 文件）
+curl -X POST http://localhost:8080/generate \
+     -H "Content-Type: application/json" \
+     -d '{"caption": "A dreamy synthwave track", "duration": 30}' \
+     -o output.wav
+
+# 纯 DiT 模式启动（不加载 LM）
+python music_generate_server.py --port 8080 --no_lm
+```
+
 ## 文件结构
 
 ```
 .
 ├── setup.sh                  # 一键部署脚本
-├── music_caption.py          # CLI 批量处理工具
-├── music_caption_server.py   # HTTP API 服务
+├── music_caption.py          # Music Caption CLI 工具
+├── music_caption_server.py   # Music Caption HTTP API
+├── music_generate.py         # Music Generation CLI 工具
+├── music_generate_server.py  # Music Generation HTTP API
+├── architecture.md           # 模型架构与 forward 流向图
 ├── README.md                 # 本文档
 └── ACE-Step-1.5/             # (自动克隆) ACE-Step 1.5 仓库
     ├── acestep/

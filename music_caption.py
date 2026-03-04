@@ -165,17 +165,14 @@ def initialize_llm_handler(
     handler = LLMHandler()
     print(f"[INFO] 正在初始化 LLM 模型: {lm_model} ...")
 
-    model_path = os.path.join(ACEST_DIR, "checkpoints", lm_model)
-    if not os.path.isdir(model_path):
-        print(f"[INFO] 模型 {lm_model} 不在本地，将自动从 HuggingFace 下载...")
-        model_path = f"ACE-Step/{lm_model}"
-
-    status = handler.initialize(
-        model_path=model_path,
+    checkpoint_dir = os.path.join(ACEST_DIR, "checkpoints")
+    status, success = handler.initialize(
+        checkpoint_dir=checkpoint_dir,
+        lm_model_path=lm_model,
         backend=backend,
         device=device,
     )
-    if not handler.llm_initialized:
+    if not success:
         print(f"[ERROR] LLM 模型初始化失败: {status}")
         sys.exit(1)
     print(f"[INFO] LLM 模型初始化完成 (backend={handler.llm_backend})")

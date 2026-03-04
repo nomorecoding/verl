@@ -129,12 +129,15 @@ def init_models(
 
     print(f"[INFO] 初始化 LLM 模型: {lm_model} ...")
     llm_handler = LLMHandler()
-    model_path = os.path.join(ACEST_DIR, "checkpoints", lm_model)
-    if not os.path.isdir(model_path):
-        model_path = f"ACE-Step/{lm_model}"
-    llm_handler.initialize(model_path=model_path, backend=lm_backend, device=device)
-    if not llm_handler.llm_initialized:
-        raise RuntimeError("LLM 初始化失败")
+    checkpoint_dir = os.path.join(ACEST_DIR, "checkpoints")
+    status, success = llm_handler.initialize(
+        checkpoint_dir=checkpoint_dir,
+        lm_model_path=lm_model,
+        backend=lm_backend,
+        device=device,
+    )
+    if not success:
+        raise RuntimeError(f"LLM 初始化失败: {status}")
     print(f"[INFO] LLM 模型就绪 (backend={llm_handler.llm_backend})")
 
 
